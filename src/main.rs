@@ -12,7 +12,7 @@ use winit::{
 use std::sync::Arc;
 use std::time::Instant;
 
-const N: usize = 200;
+const N: usize = 1000;
 const MAX_PER_TILE: usize = 32;
 const TILE_SIZE: u32 = 16;
 
@@ -35,6 +35,8 @@ struct App {
     shape: usize,
     last_time: Instant,
     needs_redraw: bool,
+    frame_count: u32,
+    fps_time: Instant,
 }
 
 // ── Shape generators ──
@@ -181,7 +183,7 @@ impl App {
 
             bboxes.push((x0, y0, x0 + w_item, y0 + h_item));
         }
-        for _ in count..256 {
+        for _ in count..N {
             for _ in 0..12 { gpu.push_f32(0.0); }
         }
         gpu.flush_to_buffer(scene.items_buf);
@@ -260,7 +262,7 @@ impl ApplicationHandler for App {
         gpu.push_u32(0);
         gpu.flush_to_buffer(params_buf);
 
-        let items_buf = gpu.create_buffer(256 * 48, 0x0080 | 0x0008);
+        let items_buf = gpu.create_buffer((N * 48) as i64, 0x0080 | 0x0008);
         let tile_counts_buf = gpu.create_buffer((tile_count * 4) as i64, 0x0080 | 0x0008);
         let tile_ids_buf = gpu.create_buffer((tile_count * MAX_PER_TILE as u32 * 4) as i64, 0x0080 | 0x0008);
 
@@ -322,6 +324,17 @@ impl ApplicationHandler for App {
                     (gpu.width() + 15) / 16, (gpu.height() + 15) / 16,
                 );
 
+                self.frame_count += 1;
+                let fps_elapsed = now.duration_since(self.fps_time).as_secs_f64();
+                if fps_elapsed >= 1.0 {
+                    let fps = self.frame_count as f64 / fps_elapsed;
+                    if let Some(w) = &self.window {
+                        w.set_title(&format!("ceangal-native tile dispatch — {} items, {:.0} fps", N, fps));
+                    }
+                    self.frame_count = 0;
+                    self.fps_time = now;
+                }
+
                 if any_moving {
                     self.window.as_ref().unwrap().request_redraw();
                 } else {
@@ -346,6 +359,7 @@ fn main() {
         gpu: None, scene: None, window: None,
         particles: Vec::new(), shape: 0,
         last_time: Instant::now(), needs_redraw: false,
+        frame_count: 0, fps_time: Instant::now(),
     };
     event_loop.run_app(&mut app).unwrap();
 }
