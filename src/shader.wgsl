@@ -1,17 +1,21 @@
-// ceangal-native minimal shader
-// Compute: items → pixel buffer
+// ceangal-native tile-based dispatch shader
+// Compute: tile lookup → per-tile items → SDF → pixel buffer
 // Fragment: pixel buffer → screen
+
+const MAX_PER_TILE: u32 = 32u;
 
 struct Params {
   width: u32,
   height: u32,
-  _pad0: u32,
+  tiles_x: u32,
   _pad1: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> pixels: array<u32>;
 @group(0) @binding(1) var<uniform>             params: Params;
 @group(0) @binding(2) var<storage, read>       items: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read>       tile_counts: array<u32>;
+@group(0) @binding(4) var<storage, read>       tile_ids: array<u32>;
 
 fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
   let q = abs(p) - b + vec2<f32>(r, r);
@@ -27,16 +31,20 @@ fn pack_color(r: f32, g: f32, b: f32, a: f32) -> u32 {
 }
 
 @compute @workgroup_size(16, 16)
-fn fine(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn fine(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(workgroup_id) wg: vec3<u32>) {
   let px = gid.x;
   let py = gid.y;
   if (px >= params.width || py >= params.height) { return; }
 
-  let ri_count = u32(items[2].w);
+  let tile_id = wg.y * params.tiles_x + wg.x;
+  let item_count = tile_counts[tile_id];
+
   var color = vec3<f32>(0.0);
   var alpha = 0.0;
 
-  for (var ri = 0u; ri < min(ri_count, 256u); ri++) {
+  for (var i = 0u; i < min(item_count, MAX_PER_TILE); i++) {
+    let ri = tile_ids[tile_id * MAX_PER_TILE + i];
     let pos = items[ri * 3u];
     let col = items[ri * 3u + 1u];
     let item_meta = items[ri * 3u + 2u];
@@ -104,7 +112,6 @@ fn fs_fullscreen(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let b = f32((packed >> 16u) & 0xFFu) / 255.0;
   let a = f32((packed >> 24u) & 0xFFu) / 255.0;
 
-  // Dark background + items composited
   let bg = vec3<f32>(0.04, 0.04, 0.07);
   let final_color = mix(bg, vec3(r, g, b), a);
 

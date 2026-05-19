@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const N: usize = 200;
+const MAX_PER_TILE: usize = 32;
+const TILE_SIZE: u32 = 16;
 
 struct Scene {
     compute_pipeline: i64,
@@ -21,6 +23,8 @@ struct Scene {
     render_bg: i64,
     items_buf: i64,
     params_buf: i64,
+    tile_counts_buf: i64,
+    tile_ids_buf: i64,
 }
 
 struct App {
@@ -132,7 +136,15 @@ impl App {
     fn upload_items(&mut self) {
         let gpu = self.gpu.as_mut().unwrap();
         let scene = self.scene.as_ref().unwrap();
+        let w = gpu.width();
+        let h = gpu.height();
+        let tiles_x = (w + TILE_SIZE - 1) / TILE_SIZE;
+        let tiles_y = (h + TILE_SIZE - 1) / TILE_SIZE;
+        let tile_count = (tiles_x * tiles_y) as usize;
         let count = self.particles.len();
+
+        // Build item data + collect bounding boxes for tile assignment
+        let mut bboxes: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(count);
 
         gpu.begin_data();
         for p in &self.particles {
@@ -143,29 +155,65 @@ impl App {
             let hue = p.hue.value();
             let r_size = 3.0 + s * 3.0;
 
-            // Position as rect centered on (x, y)
+            let x0 = (x - r_size) as f32;
+            let y0 = (y - r_size) as f32;
+            let w_item = (r_size * 2.0) as f32;
+            let h_item = (r_size * 2.0) as f32;
+
+            // Position
             gpu.push_f32(x - r_size);
             gpu.push_f32(y - r_size);
             gpu.push_f32(r_size * 2.0);
             gpu.push_f32(r_size * 2.0);
 
-            // HSL → RGB (simplified)
+            // Color (HSL → RGB)
             let (r, g, b) = hsl_to_rgb(hue / 360.0, 0.8, 0.65);
             gpu.push_f32(r);
             gpu.push_f32(g);
             gpu.push_f32(b);
             gpu.push_f32(o);
 
-            // Meta: rounded, opacity, scrollable, count
-            gpu.push_f32(r_size); // fully rounded = circle
-            gpu.push_f32(1.0);
-            gpu.push_f32(0.0);
+            // Meta
+            gpu.push_f32(r_size); // corner radius
+            gpu.push_f32(1.0);    // opacity
+            gpu.push_f32(0.0);    // scrollable
             gpu.push_f32(count as f64);
+
+            bboxes.push((x0, y0, x0 + w_item, y0 + h_item));
         }
         for _ in count..256 {
             for _ in 0..12 { gpu.push_f32(0.0); }
         }
         gpu.flush_to_buffer(scene.items_buf);
+
+        // Tile assignment
+        let mut tile_counts = vec![0u32; tile_count];
+        let mut tile_ids = vec![0u32; tile_count * MAX_PER_TILE];
+
+        for (idx, &(x0, y0, x1, y1)) in bboxes.iter().enumerate() {
+            let tx0 = (x0.max(0.0) as u32) / TILE_SIZE;
+            let ty0 = (y0.max(0.0) as u32) / TILE_SIZE;
+            let tx1 = ((x1.max(0.0) as u32).min(w.saturating_sub(1))) / TILE_SIZE;
+            let ty1 = ((y1.max(0.0) as u32).min(h.saturating_sub(1))) / TILE_SIZE;
+
+            for ty in ty0..=ty1.min(tiles_y - 1) {
+                for tx in tx0..=tx1.min(tiles_x - 1) {
+                    let tile_id = (ty * tiles_x + tx) as usize;
+                    let c = tile_counts[tile_id] as usize;
+                    if c < MAX_PER_TILE {
+                        tile_ids[tile_id * MAX_PER_TILE + c] = idx as u32;
+                        tile_counts[tile_id] += 1;
+                    }
+                }
+            }
+        }
+
+        // Upload tile buffers
+        let counts_bytes: Vec<u8> = tile_counts.iter().flat_map(|c| c.to_ne_bytes()).collect();
+        gpu.write_buffer(scene.tile_counts_buf, &counts_bytes);
+
+        let ids_bytes: Vec<u8> = tile_ids.iter().flat_map(|id| id.to_ne_bytes()).collect();
+        gpu.write_buffer(scene.tile_ids_buf, &ids_bytes);
     }
 }
 
@@ -187,7 +235,7 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (f64, f64, f64) {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
-            .with_title("ceangal-anime native — click to morph")
+            .with_title("ceangal-native tile dispatch — click to morph")
             .with_inner_size(winit::dpi::LogicalSize::new(600, 600));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let mut gpu = GpuRuntime::new();
@@ -195,6 +243,9 @@ impl ApplicationHandler for App {
 
         let w = gpu.width();
         let h = gpu.height();
+        let tiles_x = (w + TILE_SIZE - 1) / TILE_SIZE;
+        let tiles_y = (h + TILE_SIZE - 1) / TILE_SIZE;
+        let tile_count = tiles_x * tiles_y;
 
         let shader_src = include_str!("shader.wgsl").to_string();
         let shader_idx = gpu.register_shader_source(shader_src);
@@ -205,17 +256,21 @@ impl ApplicationHandler for App {
         gpu.begin_data();
         gpu.push_u32(w as i64);
         gpu.push_u32(h as i64);
-        gpu.push_u32(0);
+        gpu.push_u32(tiles_x as i64);
         gpu.push_u32(0);
         gpu.flush_to_buffer(params_buf);
 
         let items_buf = gpu.create_buffer(256 * 48, 0x0080 | 0x0008);
+        let tile_counts_buf = gpu.create_buffer((tile_count * 4) as i64, 0x0080 | 0x0008);
+        let tile_ids_buf = gpu.create_buffer((tile_count * MAX_PER_TILE as u32 * 4) as i64, 0x0080 | 0x0008);
 
         let cp = gpu.create_compute_pipeline(shader);
         gpu.begin_bindings();
         gpu.add_buffer_binding(pixel_buf);
         gpu.add_buffer_binding(params_buf);
         gpu.add_buffer_binding(items_buf);
+        gpu.add_buffer_binding(tile_counts_buf);
+        gpu.add_buffer_binding(tile_ids_buf);
         let cbg = gpu.create_bind_group_for_compute(cp, 0);
 
         let rp = gpu.create_render_pipeline(shader, 0);
@@ -228,7 +283,7 @@ impl ApplicationHandler for App {
         self.scene = Some(Scene {
             compute_pipeline: cp, compute_bg: cbg,
             render_pipeline: rp, render_bg: rbg,
-            items_buf, params_buf,
+            items_buf, params_buf, tile_counts_buf, tile_ids_buf,
         });
         self.window = Some(window);
 
@@ -250,7 +305,6 @@ impl ApplicationHandler for App {
                 let dt = now.duration_since(self.last_time).as_secs_f64() * 1000.0;
                 self.last_time = now;
 
-                // Tick all particles
                 let mut any_moving = false;
                 for p in &mut self.particles {
                     p.tick(dt);
