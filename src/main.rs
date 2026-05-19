@@ -1,4 +1,6 @@
-use wgpu::util::DeviceExt;
+mod gpu_runtime;
+
+use gpu_runtime::GpuRuntime;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -7,212 +9,120 @@ use winit::{
 };
 use std::sync::Arc;
 
-struct GpuState {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    compute_pipeline: wgpu::ComputePipeline,
-    render_pipeline: wgpu::RenderPipeline,
-    pixel_buf: wgpu::Buffer,
-    params_buf: wgpu::Buffer,
-    items_buf: wgpu::Buffer,
-    compute_bg: wgpu::BindGroup,
-    render_bg: wgpu::BindGroup,
-    width: u32,
-    height: u32,
-}
-
-impl GpuState {
-    async fn new(window: Arc<Window>) -> Self {
-        let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
-        let surface = instance.create_surface(window).unwrap();
-        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }).await.unwrap();
-        let (device, queue) = adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ).await.unwrap();
-
-        let config = surface.get_default_config(&adapter, size.width.max(1), size.height.max(1)).unwrap();
-        surface.configure(&device, &config);
-
-        let w = config.width;
-        let h = config.height;
-
-        // Shader — minimal: compute writes pixels, fragment reads them
-        let shader_src = include_str!("shader.wgsl");
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
-
-        // Buffers
-        let pixel_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pixels"),
-            size: (w * h * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let params_data = [w, h, 0u32, 0]; // width, height, pad, pad
-        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("params"),
-            contents: bytemuck::cast_slice(&params_data),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Items: 1 rect (3 × vec4<f32> = 48 bytes per item, 256 items max)
-        let mut items = vec![0.0f32; 256 * 12];
-        // Item 0: x=100, y=100, w=300, h=200
-        items[0] = 100.0; items[1] = 100.0; items[2] = 300.0; items[3] = 200.0;
-        // bg color: r=0.3, g=0.5, b=0.9, a=1.0
-        items[4] = 0.3; items[5] = 0.5; items[6] = 0.9; items[7] = 1.0;
-        // meta: rounded=12, opacity=1, scrollable=0, count=1
-        items[8] = 12.0; items[9] = 1.0; items[10] = 0.0; items[11] = 1.0;
-
-        let items_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("items"),
-            contents: bytemuck::cast_slice(&items),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Compute pipeline
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("compute"),
-            layout: None,
-            module: &shader,
-            entry_point: Some("fine"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let compute_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("compute_bg"),
-            layout: &compute_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: pixel_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: items_buf.as_entire_binding() },
-            ],
-        });
-
-        // Render pipeline
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("render"),
-            layout: None,
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_fullscreen"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_fullscreen"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        let render_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("render_bg"),
-            layout: &render_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: pixel_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: params_buf.as_entire_binding() },
-            ],
-        });
-
-        Self {
-            surface, device, queue, config, compute_pipeline, render_pipeline,
-            pixel_buf, params_buf, items_buf, compute_bg, render_bg,
-            width: w, height: h,
-        }
-    }
-
-    fn render(&self) {
-        let output = self.surface.get_current_texture().unwrap();
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-
-        // Compute pass: items → pixel buffer
-        {
-            let mut cp = encoder.begin_compute_pass(&Default::default());
-            cp.set_pipeline(&self.compute_pipeline);
-            cp.set_bind_group(0, &self.compute_bg, &[]);
-            cp.dispatch_workgroups(
-                (self.width + 15) / 16,
-                (self.height + 15) / 16,
-                1,
-            );
-        }
-
-        // Render pass: pixel buffer → screen
-        {
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.04, g: 0.04, b: 0.07, a: 1.0 }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-            rp.set_pipeline(&self.render_pipeline);
-            rp.set_bind_group(0, &self.render_bg, &[]);
-            rp.draw(0..6, 0..1);
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-    }
+struct Scene {
+    compute_pipeline: i64,
+    compute_bg: i64,
+    render_pipeline: i64,
+    render_bg: i64,
 }
 
 struct App {
-    gpu: Option<GpuState>,
+    gpu: Option<GpuRuntime>,
+    scene: Option<Scene>,
     window: Option<Arc<Window>>,
+}
+
+impl App {
+    fn setup_scene(&mut self) {
+        let gpu = self.gpu.as_mut().unwrap();
+        let w = gpu.width();
+        let h = gpu.height();
+
+        // Register shader
+        let shader_src = include_str!("shader.wgsl").to_string();
+        let shader_idx = gpu.register_shader_source(shader_src);
+        let shader = gpu.create_shader(shader_idx);
+
+        // Buffers
+        let pixel_buf = gpu.create_buffer((w * h * 4) as i64, 0x0080); // STORAGE
+
+        let params_buf = gpu.create_buffer(16, 0x0040 | 0x0008); // UNIFORM | COPY_DST
+        gpu.begin_data();
+        gpu.push_u32(w as i64);
+        gpu.push_u32(h as i64);
+        gpu.push_u32(0);
+        gpu.push_u32(0);
+        gpu.flush_to_buffer(params_buf);
+
+        // Items: multiple rects to test
+        let items_buf = gpu.create_buffer(256 * 48, 0x0080 | 0x0008); // STORAGE | COPY_DST
+        let item_count = 5i64;
+        gpu.begin_data();
+
+        let rects: &[(f32, f32, f32, f32, f32, f32, f32, f32, f32)] = &[
+            // (x, y, w, h, r, g, b, a, rounded)
+            (50.0, 50.0, 200.0, 60.0, 0.15, 0.18, 0.25, 0.9, 8.0),    // header
+            (50.0, 120.0, 200.0, 40.0, 0.12, 0.14, 0.22, 0.8, 6.0),   // input field
+            (50.0, 170.0, 200.0, 40.0, 0.95, 0.95, 0.95, 0.08, 12.0), // item 1
+            (50.0, 220.0, 200.0, 40.0, 0.95, 0.95, 0.95, 0.08, 12.0), // item 2
+            (50.0, 270.0, 200.0, 40.0, 0.25, 0.50, 0.90, 1.0, 8.0),   // button
+        ];
+
+        for (i, &(x, y, rw, rh, r, g, b, a, rounded)) in rects.iter().enumerate() {
+            gpu.push_f32(x as f64); gpu.push_f32(y as f64);
+            gpu.push_f32(rw as f64); gpu.push_f32(rh as f64);
+            gpu.push_f32(r as f64); gpu.push_f32(g as f64);
+            gpu.push_f32(b as f64); gpu.push_f32(a as f64);
+            gpu.push_f32(rounded as f64); gpu.push_f32(1.0); // opacity
+            gpu.push_f32(0.0); // scrollable
+            gpu.push_f32(item_count as f64); // count
+        }
+        // Pad remaining
+        for _ in (item_count as usize)..256 {
+            for _ in 0..12 { gpu.push_f32(0.0); }
+        }
+        gpu.flush_to_buffer(items_buf);
+
+        // Compute pipeline + bind group
+        let compute_pipeline = gpu.create_compute_pipeline(shader);
+        gpu.begin_bindings();
+        gpu.add_buffer_binding(pixel_buf);
+        gpu.add_buffer_binding(params_buf);
+        gpu.add_buffer_binding(items_buf);
+        let compute_bg = gpu.create_bind_group_for_compute(compute_pipeline, 0);
+
+        // Render pipeline + bind group
+        let render_pipeline = gpu.create_render_pipeline(shader, 0);
+        gpu.begin_bindings();
+        gpu.add_buffer_binding(pixel_buf);
+        gpu.add_buffer_binding(params_buf);
+        let render_bg = gpu.create_bind_group_for_render(render_pipeline, 0);
+
+        self.scene = Some(Scene {
+            compute_pipeline,
+            compute_bg,
+            render_pipeline,
+            render_bg,
+        });
+    }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes().with_title("ceangal native");
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
-        self.gpu = Some(pollster::block_on(GpuState::new(window.clone())));
+        let mut gpu = GpuRuntime::new();
+        pollster::block_on(gpu.init(&window));
+        self.gpu = Some(gpu);
         self.window = Some(window);
+        self.setup_scene();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
-                if let Some(gpu) = &self.gpu {
-                    gpu.render();
+                if let (Some(gpu), Some(scene)) = (&self.gpu, &self.scene) {
+                    let w = gpu.width();
+                    let h = gpu.height();
+                    gpu.render_frame(
+                        scene.compute_pipeline,
+                        scene.compute_bg,
+                        scene.render_pipeline,
+                        scene.render_bg,
+                        (w + 15) / 16,
+                        (h + 15) / 16,
+                    );
                 }
             }
             _ => {}
@@ -220,15 +130,13 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+        // Don't spin — only redraw on events. Static content doesn't need continuous render.
     }
 }
 
 fn main() {
     env_logger::init();
     let event_loop = EventLoop::new().unwrap();
-    let mut app = App { gpu: None, window: None };
+    let mut app = App { gpu: None, scene: None, window: None };
     event_loop.run_app(&mut app).unwrap();
 }
